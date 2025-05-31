@@ -39,7 +39,9 @@ pub fn unzip_files(src_path: &Path, dst_path: &Path) -> io::Result<()> {
     let mut dirs_to_create: Vec<PathBuf> = Vec::new();
     let mut files_to_extract: Vec<(PathBuf, Vec<u8>, Option<u32>)> = Vec::new();
 
+    // Collect all file entries first to enable parallel processing.
     for i in 0..archive.len() {
+        // Get the file entry from the zip archive.
         let mut file_in_zip = archive.by_index(i).map_err(|e| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -47,11 +49,13 @@ pub fn unzip_files(src_path: &Path, dst_path: &Path) -> io::Result<()> {
             )
         })?;
 
+        // Get the path of the file in the zip archive.
         let outpath = match file_in_zip.enclosed_name() {
             Some(path) => dst_path.join(path),
             None => continue,
         };
 
+        // If the file is a directory, add it to the list of directories to create.
         if file_in_zip.name().ends_with('/') {
             dirs_to_create.push(outpath);
         } else {
@@ -89,6 +93,7 @@ pub fn unzip_files(src_path: &Path, dst_path: &Path) -> io::Result<()> {
 
     // Extract files in parallel for performance.
     // Each file extraction is an independent operation after directories are set up.
+    // Limit the number of threads to 8 to avoid overwhelming the system
     files_to_extract.par_iter().with_max_len(8).try_for_each(
         |(path, content, mode_opt)| -> io::Result<()> {
             // Ensure parent directory exists before writing the file.
@@ -127,6 +132,7 @@ pub fn unzip_files(src_path: &Path, dst_path: &Path) -> io::Result<()> {
                 )
             })?;
 
+            // Set permissions if available
             #[cfg(unix)]
             if let Some(mode) = mode_opt {
                 fs::set_permissions(path, fs::Permissions::from_mode(*mode)).map_err(|e| {

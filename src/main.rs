@@ -1,8 +1,6 @@
 use clap::Parser;
 use std::path::PathBuf;
 
-// This will refer to the library part of your crate
-// We call the internal functions directly from their modules
 use ziprs::{unzip::unzip_files, zip::zip_files};
 
 #[derive(Parser, Debug)]
