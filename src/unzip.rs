@@ -71,6 +71,9 @@ pub fn unzip_files(src_path: &Path, dst_path: &Path) -> io::Result<()> {
         }
     }
 
+    // Create all necessary directory structures sequentially first.
+    // This avoids race conditions that might occur if directories are created in parallel
+    // with file extractions, especially for nested structures.
     for dir_path in dirs_to_create {
         fs::create_dir_all(&dir_path).map_err(|e| {
             io::Error::new(
@@ -84,8 +87,14 @@ pub fn unzip_files(src_path: &Path, dst_path: &Path) -> io::Result<()> {
         })?;
     }
 
+    // Extract files in parallel for performance.
+    // Each file extraction is an independent operation after directories are set up.
     files_to_extract.par_iter().with_max_len(8).try_for_each(
         |(path, content, mode_opt)| -> io::Result<()> {
+            // Ensure parent directory exists before writing the file.
+            // This is necessary because a file might be listed in the zip archive
+            // before its parent directory, or the directory creation pass might have missed it
+            // if it wasn't explicitly listed as a directory entry in the zip.
             if let Some(p) = path.parent() {
                 if !p.exists() {
                     fs::create_dir_all(p).map_err(|e| {

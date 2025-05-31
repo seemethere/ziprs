@@ -46,6 +46,8 @@ pub fn zip_files(dst: &Path, srcs: &[PathBuf]) -> io::Result<()> {
                 .to_str()
                 .unwrap_or(""); // Should be valid UTF-8
 
+            // If zipping a directory, and it's not the current directory ("."),
+            // create an explicit directory entry in the zip for this top-level directory.
             if !top_level_dir_name_in_zip.is_empty() && top_level_dir_name_in_zip != "." {
                 let proper_dir_name = format!("{}/", top_level_dir_name_in_zip);
                 zip.add_directory(
@@ -54,6 +56,7 @@ pub fn zip_files(dst: &Path, srcs: &[PathBuf]) -> io::Result<()> {
                 )?;
             }
 
+            // Collect all file entries first to enable parallel processing.
             let file_entries: Vec<_> = walkdir::WalkDir::new(src_path)
                 .into_iter()
                 .filter_map(|e| e.ok())
@@ -68,7 +71,9 @@ pub fn zip_files(dst: &Path, srcs: &[PathBuf]) -> io::Result<()> {
             let src_path_clone = src_path.clone();
             let top_level_dir_name_in_zip_clone = top_level_dir_name_in_zip.to_string();
 
-            // Rayon part: Convert PyResult to io::Result
+            // Rayon parallel iteration: Read file contents and gather metadata.
+            // Sends data (archive path, content, permissions) to a channel for sequential writing to the zip.
+            // This avoids holding the ZipWriter mutex for the entire file reading duration.
             let result: Result<(), io::Error> = file_entries
                 .par_iter()
                 .with_max_len(8)
@@ -117,8 +122,10 @@ pub fn zip_files(dst: &Path, srcs: &[PathBuf]) -> io::Result<()> {
                     }
                 });
             result?; // Propagate potential error from parallel processing
-            drop(sender); // Close sender before collecting from receiver
+            drop(sender); // Close sender before collecting from receiver; signals receiver that no more messages are coming.
 
+            // After processing files, explicitly create all directory entries in the zip.
+            // This ensures directories are listed even if they are empty or processed after their files.
             let mut sub_dirs_to_add: Vec<(String, u32)> = Vec::new();
             let top_level_dir_name_in_zip_for_subdir_pass = top_level_dir_name_in_zip.to_string();
 
@@ -164,10 +171,12 @@ pub fn zip_files(dst: &Path, srcs: &[PathBuf]) -> io::Result<()> {
                 }
             }
 
+            // Sort and deduplicate directory paths to ensure correct order and avoid duplicate entries.
             sub_dirs_to_add.sort_by(|a, b| a.0.cmp(&b.0));
             sub_dirs_to_add.dedup_by(|a, b| a.0 == b.0);
 
             for (dir_path_in_zip, perms) in sub_dirs_to_add {
+                // Skip adding the current directory ("." or "") or the top-level directory itself if already handled.
                 if (top_level_dir_name_in_zip == "." && dir_path_in_zip == "./")
                     || (top_level_dir_name_in_zip.is_empty() && dir_path_in_zip == "/")
                 {
@@ -185,6 +194,7 @@ pub fn zip_files(dst: &Path, srcs: &[PathBuf]) -> io::Result<()> {
                 )?;
             }
 
+            // Now, write all file contents (received from parallel processing) to the zip archive.
             for (archive_path, content, permissions) in receiver {
                 add_file_to_zip_with_permissions(&mut zip, &archive_path, permissions, content)?;
             }
