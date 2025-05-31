@@ -12,16 +12,9 @@ use zip::{write::FileOptions, ZipWriter};
 type SimpleFileOptions = FileOptions<'static, ()>;
 
 // Core zipping logic, callable from both CLI and Python wrapper
-pub fn do_zip_internal(
-    dst: &Path,
-    srcs: &[PathBuf],
-    // password: Option<String> // Future: if password protection is added to core
-) -> io::Result<()> {
+pub fn do_zip_internal(dst: &Path, srcs: &[PathBuf]) -> io::Result<()> {
     let file = File::create(dst)?;
     let mut zip = ZipWriter::new(file);
-    // if let Some(p) = password {
-    //     // zip.set_password(p); // Example if zip crate supports it directly this way
-    // }
 
     for src_path in srcs {
         if src_path.is_file() {
@@ -57,7 +50,7 @@ pub fn do_zip_internal(
                 let proper_dir_name = format!("{}/", top_level_dir_name_in_zip);
                 zip.add_directory(
                     proper_dir_name,
-                    FileOptions::<()>::default().unix_permissions(dir_permissions),
+                    SimpleFileOptions::default().unix_permissions(dir_permissions),
                 )?;
             }
 
@@ -188,7 +181,7 @@ pub fn do_zip_internal(
                 }
                 zip.add_directory(
                     &dir_path_in_zip,
-                    FileOptions::<()>::default().unix_permissions(perms),
+                    SimpleFileOptions::default().unix_permissions(perms),
                 )?;
             }
 
@@ -207,9 +200,6 @@ pub fn zip_files(dst_py: String, srcs_py: Vec<String>) -> PyResult<()> {
     let dst_path = PathBuf::from(dst_py);
     let src_paths: Vec<PathBuf> = srcs_py.into_iter().map(PathBuf::from).collect();
 
-    // Here, you could also handle the optional password if it were passed from Python
-    // let password_py: Option<String> = None; // Example: if it was an argument
-    // do_zip_internal(&dst_path, &src_paths, password_py)
     do_zip_internal(&dst_path, &src_paths).map_err(|e| PyIOError::new_err(e.to_string()))
 }
 

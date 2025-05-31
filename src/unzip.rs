@@ -8,11 +8,7 @@ use std::path::{Path, PathBuf};
 use zip::ZipArchive;
 
 // Core unzipping logic
-pub fn do_unzip_internal(
-    src_path: &Path,
-    dst_path: &Path,
-    // password: Option<String> // Future: if password protection is needed
-) -> io::Result<()> {
+pub fn do_unzip_internal(src_path: &Path, dst_path: &Path) -> io::Result<()> {
     if !dst_path.exists() {
         fs::create_dir_all(&dst_path).map_err(|e| {
             io::Error::new(
@@ -33,11 +29,6 @@ pub fn do_unzip_internal(
         )
     })?;
 
-    // let mut archive = if let Some(p) = password {
-    //     ZipArchive::new_with_password(file, p.as_bytes())
-    // } else {
-    //     ZipArchive::new(file)
-    // }.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("Failed to read zip archive: {}", e)))?;
     let mut archive = ZipArchive::new(file).map_err(|e| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -147,9 +138,7 @@ pub fn do_unzip_internal(
 pub fn unzip_files(src_py: String, dst_py: String) -> PyResult<()> {
     let src_path = PathBuf::from(src_py);
     let dst_path = PathBuf::from(dst_py);
-    // let password_py: Option<String> = None; // Example if password was an argument
 
-    // do_unzip_internal(&src_path, &dst_path, password_py)
     do_unzip_internal(&src_path, &dst_path).map_err(|e| PyIOError::new_err(e.to_string()))
 }
 
