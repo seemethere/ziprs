@@ -5,8 +5,8 @@ use pyo3::prelude::*;
 pub mod unzip;
 pub mod zip; // Declare the new zip module
 
-pub use unzip::unzip_files; // This is for the Python interface
-pub use zip::zip_files; // This is for the Python interface
+pub use unzip::unzip_files_pywrapper; // This is for the Python interface
+pub use zip::zip_files_pywrapper; // This is for the Python interface
 
 // The zip_files function, its helpers, and SimpleFileOptions alias have been moved to src/zip.rs
 
@@ -14,9 +14,9 @@ pub use zip::zip_files; // This is for the Python interface
 #[pymodule]
 fn ziprs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Register the zip_files function as a Python-callable function
-    m.add_function(wrap_pyfunction!(zip_files, m)?)?; // This will now refer to the re-exported zip_files
-                                                      // Register the unzip_files function as a Python-callable function
-    m.add_function(wrap_pyfunction!(unzip_files, m)?)?; // This will now refer to the re-exported unzip_files
+    m.add_function(wrap_pyfunction!(zip_files_pywrapper, m)?)?; // This will now refer to the re-exported zip_files
+                                                                // Register the unzip_files function as a Python-callable function
+    m.add_function(wrap_pyfunction!(unzip_files_pywrapper, m)?)?; // This will now refer to the re-exported unzip_files
     Ok(())
 }
 

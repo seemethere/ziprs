@@ -8,9 +8,9 @@ use std::path::{Path, PathBuf};
 use zip::ZipArchive;
 
 // Core unzipping logic
-pub fn do_unzip_internal(src_path: &Path, dst_path: &Path) -> io::Result<()> {
+pub fn unzip_files(src_path: &Path, dst_path: &Path) -> io::Result<()> {
     if !dst_path.exists() {
-        fs::create_dir_all(&dst_path).map_err(|e| {
+        fs::create_dir_all(dst_path).map_err(|e| {
             io::Error::new(
                 io::ErrorKind::Other,
                 format!(
@@ -22,7 +22,7 @@ pub fn do_unzip_internal(src_path: &Path, dst_path: &Path) -> io::Result<()> {
         })?;
     }
 
-    let file = fs::File::open(&src_path).map_err(|e| {
+    let file = fs::File::open(src_path).map_err(|e| {
         io::Error::new(
             io::ErrorKind::NotFound,
             format!("Failed to open zip file '{}': {}", src_path.display(), e),
@@ -88,7 +88,7 @@ pub fn do_unzip_internal(src_path: &Path, dst_path: &Path) -> io::Result<()> {
         |(path, content, mode_opt)| -> io::Result<()> {
             if let Some(p) = path.parent() {
                 if !p.exists() {
-                    fs::create_dir_all(&p).map_err(|e| {
+                    fs::create_dir_all(p).map_err(|e| {
                         io::Error::new(
                             io::ErrorKind::Other,
                             format!(
@@ -101,13 +101,13 @@ pub fn do_unzip_internal(src_path: &Path, dst_path: &Path) -> io::Result<()> {
                 }
             }
 
-            let mut outfile = fs::File::create(&path).map_err(|e| {
+            let mut outfile = fs::File::create(path).map_err(|e| {
                 io::Error::new(
                     io::ErrorKind::Other,
                     format!("Failed to create output file '{}': {}", path.display(), e),
                 )
             })?;
-            outfile.write_all(&content).map_err(|e| {
+            outfile.write_all(content).map_err(|e| {
                 io::Error::new(
                     io::ErrorKind::Other,
                     format!(
@@ -120,7 +120,7 @@ pub fn do_unzip_internal(src_path: &Path, dst_path: &Path) -> io::Result<()> {
 
             #[cfg(unix)]
             if let Some(mode) = mode_opt {
-                fs::set_permissions(&path, fs::Permissions::from_mode(*mode)).map_err(|e| {
+                fs::set_permissions(path, fs::Permissions::from_mode(*mode)).map_err(|e| {
                     io::Error::new(
                         io::ErrorKind::Other,
                         format!("Failed to set permissions on '{}': {}", path.display(), e),
@@ -135,17 +135,17 @@ pub fn do_unzip_internal(src_path: &Path, dst_path: &Path) -> io::Result<()> {
 }
 
 #[pyfunction]
-pub fn unzip_files(src_py: String, dst_py: String) -> PyResult<()> {
+pub fn unzip_files_pywrapper(src_py: String, dst_py: String) -> PyResult<()> {
     let src_path = PathBuf::from(src_py);
     let dst_path = PathBuf::from(dst_py);
 
-    do_unzip_internal(&src_path, &dst_path).map_err(|e| PyIOError::new_err(e.to_string()))
+    unzip_files(&src_path, &dst_path).map_err(|e| PyIOError::new_err(e.to_string()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*; // For unzip_files (PyO3 wrapper) and do_unzip_internal
-    use crate::zip::zip_files as zip_files_py_wrapper;
+    use crate::zip::zip_files_pywrapper as zip_files_py_wrapper;
     use std::fs::{self};
     use std::io::Read as StdRead;
     use std::os::unix::fs::PermissionsExt as OsUnixPermissionsExt;
@@ -153,12 +153,12 @@ mod tests {
 
     // Helper to call the internal unzip function for tests that want io::Result
     fn unzip_files_internal_wrapper(src: &Path, dst: &Path) -> io::Result<()> {
-        super::do_unzip_internal(src, dst)
+        super::unzip_files(src, dst)
     }
 
     // Helper to call the PyO3 wrapped unzip function
     fn unzip_files_py_wrapper_local(src: String, dst: String) -> PyResult<()> {
-        super::unzip_files(src, dst)
+        super::unzip_files_pywrapper(src, dst)
     }
 
     #[test]

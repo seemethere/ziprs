@@ -12,13 +12,13 @@ use zip::{write::FileOptions, ZipWriter};
 type SimpleFileOptions = FileOptions<'static, ()>;
 
 // Core zipping logic, callable from both CLI and Python wrapper
-pub fn do_zip_internal(dst: &Path, srcs: &[PathBuf]) -> io::Result<()> {
+pub fn zip_files(dst: &Path, srcs: &[PathBuf]) -> io::Result<()> {
     let file = File::create(dst)?;
     let mut zip = ZipWriter::new(file);
 
     for src_path in srcs {
         if src_path.is_file() {
-            let metadata = fs::metadata(&src_path)?;
+            let metadata = fs::metadata(src_path)?;
             let permissions = metadata.permissions().mode();
             let file_name_in_archive = src_path
                 .file_name()
@@ -32,12 +32,12 @@ pub fn do_zip_internal(dst: &Path, srcs: &[PathBuf]) -> io::Result<()> {
 
             add_file_from_path_to_zip_with_permissions(
                 &mut zip,
-                &src_path,
+                src_path,
                 file_name_in_archive,
                 permissions,
             )?;
         } else if src_path.is_dir() {
-            let dir_metadata = fs::metadata(&src_path)?;
+            let dir_metadata = fs::metadata(src_path)?;
             let dir_permissions = dir_metadata.permissions().mode();
 
             let top_level_dir_name_in_zip = src_path
@@ -54,7 +54,7 @@ pub fn do_zip_internal(dst: &Path, srcs: &[PathBuf]) -> io::Result<()> {
                 )?;
             }
 
-            let file_entries: Vec<_> = walkdir::WalkDir::new(&src_path)
+            let file_entries: Vec<_> = walkdir::WalkDir::new(src_path)
                 .into_iter()
                 .filter_map(|e| e.ok())
                 .collect();
@@ -122,13 +122,13 @@ pub fn do_zip_internal(dst: &Path, srcs: &[PathBuf]) -> io::Result<()> {
             let mut sub_dirs_to_add: Vec<(String, u32)> = Vec::new();
             let top_level_dir_name_in_zip_for_subdir_pass = top_level_dir_name_in_zip.to_string();
 
-            for entry in walkdir::WalkDir::new(&src_path)
+            for entry in walkdir::WalkDir::new(src_path)
                 .into_iter()
                 .filter_map(|e| e.ok())
             {
                 let path = entry.path();
                 if path.is_dir() {
-                    let rel_path = match path.strip_prefix(&src_path) {
+                    let rel_path = match path.strip_prefix(src_path) {
                         Ok(p) => p,
                         Err(_) => continue,
                     };
@@ -196,11 +196,11 @@ pub fn do_zip_internal(dst: &Path, srcs: &[PathBuf]) -> io::Result<()> {
 
 // PyO3 wrapper function
 #[pyfunction]
-pub fn zip_files(dst_py: String, srcs_py: Vec<String>) -> PyResult<()> {
+pub fn zip_files_pywrapper(dst_py: String, srcs_py: Vec<String>) -> PyResult<()> {
     let dst_path = PathBuf::from(dst_py);
     let src_paths: Vec<PathBuf> = srcs_py.into_iter().map(PathBuf::from).collect();
 
-    do_zip_internal(&dst_path, &src_paths).map_err(|e| PyIOError::new_err(e.to_string()))
+    zip_files(&dst_path, &src_paths).map_err(|e| PyIOError::new_err(e.to_string()))
 }
 
 // Helper function to add a file to the zip archive with permissions
@@ -233,7 +233,7 @@ fn add_file_from_path_to_zip_with_permissions<W: std::io::Write + std::io::Seek>
 
 #[cfg(test)]
 mod tests {
-    use super::*; // Imports do_zip_internal and the pyfunction zip_files
+    use super::*; // Imports zip_files and the pyfunction zip_files
     use std::fs::{self, File};
     use std::io::Read;
     use std::os::unix::fs::PermissionsExt;
@@ -241,12 +241,12 @@ mod tests {
 
     // Helper to call the Python-wrapped version for tests that expect PyResult
     fn zip_files_py_wrapper(dst: String, srcs: Vec<String>) -> PyResult<()> {
-        super::zip_files(dst, srcs)
+        super::zip_files_pywrapper(dst, srcs)
     }
 
     // Or, a helper to call internal if tests want to use io::Result
     fn zip_files_internal_wrapper(dst: &Path, srcs: &[PathBuf]) -> io::Result<()> {
-        super::do_zip_internal(dst, srcs)
+        super::zip_files(dst, srcs)
     }
 
     #[test]

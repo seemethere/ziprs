@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 // This will refer to the library part of your crate
 // We call the internal functions directly from their modules
-use ziprs::{unzip::do_unzip_internal, zip::do_zip_internal};
+use ziprs::{unzip::unzip_files, zip::zip_files};
 
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
@@ -45,7 +45,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             output_path,
         } => {
             println!("Zipping {:?} to {:?}...", input_paths, output_path);
-            do_zip_internal(&output_path, &input_paths)
+            zip_files(&output_path, &input_paths)
                 .map_err(|e| format!("Failed to zip files: {}", e))?;
             println!("Successfully zipped files to {}.\n", output_path.display());
         }
@@ -54,7 +54,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             output_dir,
         } => {
             println!("Unzipping {:?} to {:?}...", zip_path, output_dir);
-            do_unzip_internal(&zip_path, &output_dir)
+            unzip_files(&zip_path, &output_dir)
                 .map_err(|e| format!("Failed to unzip archive: {}", e))?;
             println!(
                 "Successfully unzipped archive {} to {}.\n",
