@@ -30,12 +30,8 @@ pub fn zip_files(dst: &Path, srcs: &[PathBuf]) -> io::Result<()> {
                     io::Error::new(io::ErrorKind::InvalidData, "Filename is not valid UTF-8")
                 })?;
 
-            add_file_from_path_to_zip_with_permissions(
-                &mut zip,
-                src_path,
-                file_name_in_archive,
-                permissions,
-            )?;
+            let content = fs::read(src_path)?;
+            add_file_to_zip_with_permissions(&mut zip, file_name_in_archive, permissions, content)?;
         } else if src_path.is_dir() {
             let dir_metadata = fs::metadata(src_path)?;
             let dir_permissions = dir_metadata.permissions().mode();
@@ -226,19 +222,6 @@ fn add_file_to_zip_with_permissions<W: std::io::Write + std::io::Seek>(
     zip.start_file(archive_path, file_options)?;
     zip.write_all(&content)?;
     Ok(())
-}
-
-// Helper function to add a file from filesystem to zip with permissions
-// Changed to return io::Result
-fn add_file_from_path_to_zip_with_permissions<W: std::io::Write + std::io::Seek>(
-    zip: &mut ZipWriter<W>,
-    file_path: &Path,
-    archive_path: &str,
-    permissions: u32,
-) -> io::Result<()> {
-    // Changed PyResult to io::Result
-    let content = fs::read(file_path)?;
-    add_file_to_zip_with_permissions(zip, archive_path, permissions, content)
 }
 
 #[cfg(test)]
