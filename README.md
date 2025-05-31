@@ -1,8 +1,13 @@
-# ZipRs: High-Performance Zip Archiving Utility
+# ziprs: High-Performance Zip Archiving Utility
 
 ## Overview
 
 ZipRs is a Rust-based utility designed for efficient creation of ZIP archives. It provides both a Rust library and Python bindings (via PyO3) for seamless integration into various workflows. The core focus is on performance, leveraging parallel processing for directory traversal and compression where applicable, and correctness, including preserving file permissions.
+
+> [!NOTE]
+> For anyone looking at this as a serious project just know that I'm normally a Python developer who 
+> vibe coded most of this. I think it works and plan to refine it as time goes on but wanted to
+> have a disclaimer ahead of time
 
 ## Features
 
