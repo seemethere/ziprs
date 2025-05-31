@@ -1,110 +1,139 @@
 use pyo3::exceptions::PyIOError;
 use pyo3::prelude::*;
 use rayon::prelude::*;
-use std::fs;
-use std::io::{Read, Write};
+use std::fs::{self};
+use std::io::{self, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use zip::ZipArchive;
 
-#[pyfunction]
-pub fn unzip_files(src: String, dst: String) -> PyResult<()> {
-    let src_path = Path::new(&src);
-    let dst_path = Path::new(&dst);
-
-    // Ensure destination directory exists
+// Core unzipping logic
+pub fn do_unzip_internal(
+    src_path: &Path,
+    dst_path: &Path,
+    // password: Option<String> // Future: if password protection is needed
+) -> io::Result<()> {
     if !dst_path.exists() {
         fs::create_dir_all(&dst_path).map_err(|e| {
-            PyIOError::new_err(format!("Failed to create destination directory: {}", e))
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!(
+                    "Failed to create destination directory '{}': {}",
+                    dst_path.display(),
+                    e
+                ),
+            )
         })?;
     }
 
-    let file = fs::File::open(&src_path)
-        .map_err(|e| PyIOError::new_err(format!("Failed to open zip file: {}", e)))?;
-    let mut archive = ZipArchive::new(file)
-        .map_err(|e| PyIOError::new_err(format!("Failed to read zip archive: {}", e)))?;
+    let file = fs::File::open(&src_path).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("Failed to open zip file '{}': {}", src_path.display(), e),
+        )
+    })?;
+
+    // let mut archive = if let Some(p) = password {
+    //     ZipArchive::new_with_password(file, p.as_bytes())
+    // } else {
+    //     ZipArchive::new(file)
+    // }.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("Failed to read zip archive: {}", e)))?;
+    let mut archive = ZipArchive::new(file).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Failed to read zip archive: {}", e),
+        )
+    })?;
 
     let mut dirs_to_create: Vec<PathBuf> = Vec::new();
     let mut files_to_extract: Vec<(PathBuf, Vec<u8>, Option<u32>)> = Vec::new();
 
-    // Iterate over each file and directory in the zip archive.
     for i in 0..archive.len() {
-        let mut file_in_zip = archive
-            .by_index(i)
-            .map_err(|e| PyIOError::new_err(format!("Failed to read file in zip: {}", e)))?;
+        let mut file_in_zip = archive.by_index(i).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Failed to read file in zip by index {}: {}", i, e),
+            )
+        })?;
 
-        // Construct the full output path for the current item.
-        // `enclosed_name` ensures that the path is safe and does not traverse outside the destination.
         let outpath = match file_in_zip.enclosed_name() {
             Some(path) => dst_path.join(path),
-            None => continue, // Skip potentially malicious or invalid paths.
+            None => continue,
         };
 
-        // Check if the entry is a directory.
         if file_in_zip.name().ends_with('/') {
-            // If it's a directory, add it to a list for later creation.
             dirs_to_create.push(outpath);
         } else {
-            // If it's a file, read its content.
             let mut content = Vec::new();
             file_in_zip.read_to_end(&mut content).map_err(|e| {
-                PyIOError::new_err(format!("Failed to read file content from zip: {}", e))
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    format!(
+                        "Failed to read file content from zip entry '{}': {}",
+                        file_in_zip.name(),
+                        e
+                    ),
+                )
             })?;
-
-            // Get the Unix mode (permissions) of the file, if available.
             let mode = file_in_zip.unix_mode();
-            // Add the file's path, content, and mode to a list for later extraction.
             files_to_extract.push((outpath, content, mode));
         }
     }
 
-    // Create all directories first. `create_dir_all` is idempotent.
     for dir_path in dirs_to_create {
         fs::create_dir_all(&dir_path).map_err(|e| {
-            PyIOError::new_err(format!("Failed to create directory structure: {}", e))
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!(
+                    "Failed to create directory structure at '{}': {}",
+                    dir_path.display(),
+                    e
+                ),
+            )
         })?;
     }
 
-    // Extract files in parallel
     files_to_extract.par_iter().with_max_len(8).try_for_each(
-        |(path, content, mode_opt)| -> PyResult<()> {
-            // Ensure parent directory exists (for files whose parent dirs might not be explicit in zip)
+        |(path, content, mode_opt)| -> io::Result<()> {
             if let Some(p) = path.parent() {
                 if !p.exists() {
-                    // Check to avoid redundant calls if already created
                     fs::create_dir_all(&p).map_err(|e| {
-                        PyIOError::new_err(format!(
-                            "Failed to create parent directory for file {}: {}",
-                            path.display(),
-                            e
-                        ))
+                        io::Error::new(
+                            io::ErrorKind::Other,
+                            format!(
+                                "Failed to create parent directory for file '{}': {}",
+                                path.display(),
+                                e
+                            ),
+                        )
                     })?;
                 }
             }
 
             let mut outfile = fs::File::create(&path).map_err(|e| {
-                PyIOError::new_err(format!(
-                    "Failed to create output file {}: {}",
-                    path.display(),
-                    e
-                ))
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("Failed to create output file '{}': {}", path.display(), e),
+                )
             })?;
             outfile.write_all(&content).map_err(|e| {
-                PyIOError::new_err(format!(
-                    "Failed to write content to file {}: {}",
-                    path.display(),
-                    e
-                ))
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    format!(
+                        "Failed to write content to file '{}': {}",
+                        path.display(),
+                        e
+                    ),
+                )
             })?;
 
             #[cfg(unix)]
             if let Some(mode) = mode_opt {
                 fs::set_permissions(&path, fs::Permissions::from_mode(*mode)).map_err(|e| {
-                    PyIOError::new_err(format!(
-                        "Failed to set permissions on {}: {}",
-                        path.display(),
-                        e
-                    ))
+                    io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("Failed to set permissions on '{}': {}", path.display(), e),
+                    )
                 })?;
             }
             Ok(())
@@ -114,14 +143,34 @@ pub fn unzip_files(src: String, dst: String) -> PyResult<()> {
     Ok(())
 }
 
+#[pyfunction]
+pub fn unzip_files(src_py: String, dst_py: String) -> PyResult<()> {
+    let src_path = PathBuf::from(src_py);
+    let dst_path = PathBuf::from(dst_py);
+    // let password_py: Option<String> = None; // Example if password was an argument
+
+    // do_unzip_internal(&src_path, &dst_path, password_py)
+    do_unzip_internal(&src_path, &dst_path).map_err(|e| PyIOError::new_err(e.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::zip_files; // Import the zip_files function from lib.rs
-    use std::fs;
-    use std::io::Read;
-    use std::os::unix::fs::PermissionsExt;
+    use super::*; // For unzip_files (PyO3 wrapper) and do_unzip_internal
+    use crate::zip::zip_files as zip_files_py_wrapper;
+    use std::fs::{self};
+    use std::io::Read as StdRead;
+    use std::os::unix::fs::PermissionsExt as OsUnixPermissionsExt;
     use tempfile::tempdir;
+
+    // Helper to call the internal unzip function for tests that want io::Result
+    fn unzip_files_internal_wrapper(src: &Path, dst: &Path) -> io::Result<()> {
+        super::do_unzip_internal(src, dst)
+    }
+
+    // Helper to call the PyO3 wrapped unzip function
+    fn unzip_files_py_wrapper_local(src: String, dst: String) -> PyResult<()> {
+        super::unzip_files(src, dst)
+    }
 
     #[test]
     fn test_unzip_files_basic() {
@@ -129,7 +178,6 @@ mod tests {
         let zip_file_path = original_dir.path().join("archive.zip");
         let extracted_dir = tempdir().unwrap();
 
-        // 1. Create source files and directories
         let file1_path = original_dir.path().join("file1.txt");
         let subdir_path = original_dir.path().join("subdir");
         let subfile_path = subdir_path.join("subfile.txt");
@@ -138,43 +186,37 @@ mod tests {
         fs::create_dir(&subdir_path).unwrap();
         fs::write(&subfile_path, "hello from subfile").unwrap();
 
-        // Set specific permissions for testing
         let mut perms_file1 = fs::metadata(&file1_path).unwrap().permissions();
-        perms_file1.set_mode(0o644); // rw-r--r--
+        // Use the explicitly imported trait for set_mode
+        OsUnixPermissionsExt::set_mode(&mut perms_file1, 0o644);
         fs::set_permissions(&file1_path, perms_file1).unwrap();
 
         let mut perms_subfile = fs::metadata(&subfile_path).unwrap().permissions();
-        perms_subfile.set_mode(0o755); // rwxr-xr-x
+        // Use the explicitly imported trait for set_mode
+        OsUnixPermissionsExt::set_mode(&mut perms_subfile, 0o755);
         fs::set_permissions(&subfile_path, perms_subfile).unwrap();
 
-        // 2. Zip these files using the zip_files function from lib.rs
         let srcs_to_zip = vec![
             file1_path.to_str().unwrap().to_string(),
             subdir_path.to_str().unwrap().to_string(),
         ];
-        zip_files(zip_file_path.to_str().unwrap().to_string(), srcs_to_zip).unwrap();
+        // Call the PyO3 wrapper for zipping from the zip module (via lib.rs)
+        zip_files_py_wrapper(zip_file_path.to_str().unwrap().to_string(), srcs_to_zip).unwrap();
 
-        // 3. Unzip the archive using unzip_files
-        unzip_files(
+        // Test the PyO3 wrapper for unzipping
+        unzip_files_py_wrapper_local(
             zip_file_path.to_str().unwrap().to_string(),
             extracted_dir.path().to_str().unwrap().to_string(),
         )
         .unwrap();
 
-        // 4. Verify extracted content and structure
         let extracted_file1 = extracted_dir.path().join("file1.txt");
         let extracted_subdir = extracted_dir.path().join("subdir");
         let extracted_subfile = extracted_subdir.join("subfile.txt");
 
-        assert!(extracted_file1.exists(), "file1.txt should be extracted");
-        assert!(
-            extracted_subdir.is_dir(),
-            "subdir should be extracted as a directory"
-        );
-        assert!(
-            extracted_subfile.exists(),
-            "subdir/subfile.txt should be extracted"
-        );
+        assert!(extracted_file1.exists());
+        assert!(extracted_subdir.is_dir());
+        assert!(extracted_subfile.exists());
 
         let mut content_file1 = String::new();
         fs::File::open(&extracted_file1)
@@ -190,30 +232,24 @@ mod tests {
             .unwrap();
         assert_eq!(content_subfile, "hello from subfile");
 
-        // 5. Verify permissions
         #[cfg(unix)]
         {
-            let perms_ext_file1 = fs::metadata(&extracted_file1).unwrap().permissions().mode();
-            assert_eq!(
-                perms_ext_file1 & 0o777,
-                0o644,
-                "Permissions for file1.txt mismatch. Expected {:o}, got {:o}",
-                0o644,
-                perms_ext_file1 & 0o777
-            );
+            // Use the explicitly imported trait for mode()
+            let perms_ext_file1 =
+                OsUnixPermissionsExt::mode(&fs::metadata(&extracted_file1).unwrap().permissions());
+            assert_eq!(perms_ext_file1 & 0o777, 0o644);
 
-            let perms_ext_subfile = fs::metadata(&extracted_subfile)
-                .unwrap()
-                .permissions()
-                .mode();
-            assert_eq!(
-                perms_ext_subfile & 0o777,
-                0o755,
-                "Permissions for subfile.txt mismatch. Expected {:o}, got {:o}",
-                0o755,
-                perms_ext_subfile & 0o777
+            let perms_ext_subfile = OsUnixPermissionsExt::mode(
+                &fs::metadata(&extracted_subfile).unwrap().permissions(),
             );
+            assert_eq!(perms_ext_subfile & 0o777, 0o755);
         }
+
+        // Optionally, test internal unzip function
+        let extracted_dir_internal = tempdir().unwrap();
+        unzip_files_internal_wrapper(&zip_file_path, extracted_dir_internal.path()).unwrap();
+        // Add assertions for internal version similar to above
+        assert!(extracted_dir_internal.path().join("file1.txt").exists());
     }
 
     #[test]
@@ -221,77 +257,43 @@ mod tests {
         let original_dir = tempdir().unwrap();
         let zip_file_path = original_dir.path().join("archive.zip");
         let extracted_base_dir = tempdir().unwrap();
-        let extracted_dir_path = extracted_base_dir.path().join("new_dest_dir"); // This directory does not exist yet
+        let extracted_dir_path = extracted_base_dir.path().join("new_dest_dir");
 
-        // Create a dummy file to zip
         let file1_path = original_dir.path().join("dummy.txt");
         fs::write(&file1_path, "dummy content").unwrap();
         let srcs_to_zip = vec![file1_path.to_str().unwrap().to_string()];
-        zip_files(zip_file_path.to_str().unwrap().to_string(), srcs_to_zip).unwrap();
+        zip_files_py_wrapper(zip_file_path.to_str().unwrap().to_string(), srcs_to_zip).unwrap();
 
-        // Attempt to unzip to a non-existent directory
-        let result = unzip_files(
+        let result = unzip_files_py_wrapper_local(
             zip_file_path.to_str().unwrap().to_string(),
             extracted_dir_path.to_str().unwrap().to_string(),
         );
-        assert!(
-            result.is_ok(),
-            "Unzipping to a non-existent path should succeed by creating the directory."
-        );
-
-        // Verify the directory and file were created
-        assert!(
-            extracted_dir_path.exists(),
-            "Destination directory should have been created."
-        );
-        assert!(
-            extracted_dir_path.is_dir(),
-            "Destination path should be a directory."
-        );
-        let extracted_file = extracted_dir_path.join("dummy.txt");
-        assert!(
-            extracted_file.exists(),
-            "dummy.txt should be extracted into the new directory."
-        );
+        assert!(result.is_ok());
+        assert!(extracted_dir_path.exists() && extracted_dir_path.is_dir());
+        assert!(extracted_dir_path.join("dummy.txt").exists());
     }
 
     #[test]
     fn test_unzip_empty_directory() {
         let original_dir = tempdir().unwrap();
-        let zip_file_path = original_dir.path().join("archive_with_empty_dir.zip");
+        let zip_file_path = original_dir.path().join("archive.zip");
         let extracted_dir = tempdir().unwrap();
 
-        // Create an empty directory
-        let empty_subdir_path = original_dir.path().join("empty_subdir");
-        fs::create_dir(&empty_subdir_path).unwrap();
+        let empty_dir_src = original_dir.path().join("empty_folder");
+        fs::create_dir(&empty_dir_src).unwrap();
 
-        // Zip this empty directory
-        let srcs_to_zip = vec![empty_subdir_path.to_str().unwrap().to_string()];
-        zip_files(zip_file_path.to_str().unwrap().to_string(), srcs_to_zip).unwrap();
+        let srcs_to_zip = vec![empty_dir_src.to_str().unwrap().to_string()];
+        zip_files_py_wrapper(zip_file_path.to_str().unwrap().to_string(), srcs_to_zip).unwrap();
 
-        // Unzip
-        unzip_files(
+        unzip_files_py_wrapper_local(
             zip_file_path.to_str().unwrap().to_string(),
             extracted_dir.path().to_str().unwrap().to_string(),
         )
         .unwrap();
 
-        // Verify the empty directory was created
-        let extracted_empty_subdir = extracted_dir.path().join("empty_subdir");
-        assert!(
-            extracted_empty_subdir.exists(),
-            "Empty subdirectory should be extracted."
-        );
-        assert!(
-            extracted_empty_subdir.is_dir(),
-            "Extracted path for empty subdirectory should be a directory."
-        );
-        assert!(
-            fs::read_dir(&extracted_empty_subdir)
-                .unwrap()
-                .next()
-                .is_none(),
-            "Extracted empty subdirectory should be empty."
-        );
+        let extracted_empty_dir = extracted_dir.path().join("empty_folder");
+        assert!(extracted_empty_dir.exists() && extracted_empty_dir.is_dir());
+        // Check if it's actually empty
+        assert_eq!(fs::read_dir(&extracted_empty_dir).unwrap().count(), 0);
     }
 }

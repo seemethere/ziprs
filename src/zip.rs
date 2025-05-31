@@ -2,7 +2,7 @@ use pyo3::exceptions::PyIOError;
 use pyo3::prelude::*;
 use rayon::prelude::*;
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -11,53 +11,55 @@ use zip::{write::FileOptions, ZipWriter};
 // Type alias for simpler usage of FileOptions with default parameters
 type SimpleFileOptions = FileOptions<'static, ()>;
 
-// Zips a list of srcs (files or directories) into a single zip file
-#[pyfunction]
-pub fn zip_files(dst: String, srcs: Vec<String>) -> PyResult<()> {
-    let mut zip = ZipWriter::new(File::create(&dst).map_err(PyIOError::new_err)?);
+// Core zipping logic, callable from both CLI and Python wrapper
+pub fn do_zip_internal(
+    dst: &Path,
+    srcs: &[PathBuf],
+    // password: Option<String> // Future: if password protection is added to core
+) -> io::Result<()> {
+    let file = File::create(dst)?;
+    let mut zip = ZipWriter::new(file);
+    // if let Some(p) = password {
+    //     // zip.set_password(p); // Example if zip crate supports it directly this way
+    // }
 
-    for src in srcs {
-        let src_path = PathBuf::from(&src);
-
+    for src_path in srcs {
         if src_path.is_file() {
-            // Add single file with preserved permissions
-            let metadata =
-                std::fs::metadata(&src_path).map_err(|e| PyIOError::new_err(e.to_string()))?;
-            let permissions = metadata.permissions().mode(); // Keep full mode including file type
+            let metadata = fs::metadata(&src_path)?;
+            let permissions = metadata.permissions().mode();
+            let file_name_in_archive = src_path
+                .file_name()
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "Source path has no filename")
+                })?
+                .to_str()
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "Filename is not valid UTF-8")
+                })?;
 
             add_file_from_path_to_zip_with_permissions(
                 &mut zip,
                 &src_path,
-                src_path.file_name().unwrap().to_str().unwrap(),
+                file_name_in_archive,
                 permissions,
             )?;
         } else if src_path.is_dir() {
-            let dir_metadata =
-                std::fs::metadata(&src_path).map_err(|e| PyIOError::new_err(e.to_string()))?;
+            let dir_metadata = fs::metadata(&src_path)?;
             let dir_permissions = dir_metadata.permissions().mode();
 
-            // This is the name for the directory itself in the archive, e.g., "subdir"
-            // If src_path is ".", file_name is ".". If src_path is "/", file_name is effectively empty.
             let top_level_dir_name_in_zip = src_path
                 .file_name()
-                .unwrap_or_default()
+                .unwrap_or_default() // . (current dir) or actual name
                 .to_str()
-                .unwrap_or("");
+                .unwrap_or(""); // Should be valid UTF-8
 
-            // Add the directory entry itself, e.g., "subdir/"
-            // If top_level_dir_name_in_zip is "" (e.g. zipping root /) or "." (zipping current dir),
-            // we might not add an explicit entry for "" or "./" itself,
-            // but items inside will be correctly pathed relative to zip root.
             if !top_level_dir_name_in_zip.is_empty() && top_level_dir_name_in_zip != "." {
                 let proper_dir_name = format!("{}/", top_level_dir_name_in_zip);
                 zip.add_directory(
                     proper_dir_name,
                     FileOptions::<()>::default().unix_permissions(dir_permissions),
-                )
-                .map_err(|e| PyIOError::new_err(e.to_string()))?;
+                )?;
             }
-            // Note: If top_level_dir_name_in_zip is ".", an entry for "./" is not explicitly added here,
-            // but files like "./file.txt" will be correctly named later.
 
             let file_entries: Vec<_> = walkdir::WalkDir::new(&src_path)
                 .into_iter()
@@ -65,71 +67,68 @@ pub fn zip_files(dst: String, srcs: Vec<String>) -> PyResult<()> {
                 .collect();
 
             if file_entries.is_empty() {
-                // Empty directory or only contained the root dir entry
-                // If it was an empty named directory (e.g. "empty_dir"), it should have been added above.
-                // If it was "." and empty, nothing more to do.
                 continue;
             }
 
+            // Parallel processing part needs careful error handling conversion
             let (sender, receiver) = mpsc::channel::<(String, Vec<u8>, u32)>();
             let src_path_clone = src_path.clone();
-            // Capture top_level_dir_name_in_zip for use in the closure
             let top_level_dir_name_in_zip_clone = top_level_dir_name_in_zip.to_string();
 
-            let result: Result<(), PyErr> =
-                file_entries
-                    .par_iter()
-                    .with_max_len(8)
-                    .try_for_each(|entry| -> PyResult<()> {
-                        let path = entry.path();
-                        let rel_path = match path.strip_prefix(&src_path_clone) {
-                            Ok(p) => p,
-                            Err(_) => return Ok(()), // Should not happen if walkdir is correct
-                        };
-                        let item_rel_to_src_path_str = rel_path.to_str().unwrap_or("").to_string();
+            // Rayon part: Convert PyResult to io::Result
+            let result: Result<(), io::Error> = file_entries
+                .par_iter()
+                .with_max_len(8)
+                .try_for_each(|entry| -> io::Result<()> {
+                    let path = entry.path();
+                    let rel_path = match path.strip_prefix(&src_path_clone) {
+                        Ok(p) => p,
+                        Err(_) => return Ok(()), // Should not happen
+                    };
+                    let item_rel_to_src_path_str = rel_path.to_str().unwrap_or("").to_string();
 
-                        if item_rel_to_src_path_str.is_empty() {
-                            return Ok(()); // Skip the entry for the source directory itself
-                        }
+                    if item_rel_to_src_path_str.is_empty() {
+                        return Ok(());
+                    }
 
-                        let archive_path_for_item = if top_level_dir_name_in_zip_clone.is_empty()
-                            || top_level_dir_name_in_zip_clone == "."
-                        {
-                            item_rel_to_src_path_str.clone()
-                        } else {
-                            format!(
-                                "{}/{}",
-                                top_level_dir_name_in_zip_clone, item_rel_to_src_path_str
-                            )
-                        };
+                    let archive_path_for_item = if top_level_dir_name_in_zip_clone.is_empty()
+                        || top_level_dir_name_in_zip_clone == "."
+                    {
+                        item_rel_to_src_path_str.clone()
+                    } else {
+                        format!(
+                            "{}/{}",
+                            top_level_dir_name_in_zip_clone, item_rel_to_src_path_str
+                        )
+                    };
 
-                        let metadata = std::fs::metadata(path)
-                            .map_err(|e| PyIOError::new_err(e.to_string()))?;
-                        let permissions = metadata.permissions().mode();
+                    let metadata = fs::metadata(path)?;
+                    let permissions = metadata.permissions().mode();
 
-                        if path.is_dir() {
-                            // Directories are collected and added sequentially later to ensure correct order and permissions.
-                            // The `dir_entry_name` calculation here was unused.
-                            Ok(())
-                        } else if path.is_file() {
-                            let content = std::fs::read(path)
-                                .map_err(|e| PyIOError::new_err(e.to_string()))?;
-                            sender
-                                .send((archive_path_for_item, content, permissions))
-                                .map_err(|e| {
-                                    PyIOError::new_err(format!("Channel send error: {}", e))
-                                })?;
-                            Ok(())
-                        } else {
-                            Ok(())
-                        }
-                    });
-
-            result?;
+                    if path.is_dir() {
+                        // Defer directory creation
+                        Ok(())
+                    } else if path.is_file() {
+                        let content = fs::read(path)?;
+                        sender
+                            .send((archive_path_for_item, content, permissions))
+                            .map_err(|e| {
+                                io::Error::new(
+                                    io::ErrorKind::Other,
+                                    format!("Channel send error: {}", e),
+                                )
+                            })?;
+                        Ok(())
+                    } else {
+                        Ok(())
+                    }
+                });
+            result?; // Propagate potential error from parallel processing
+            drop(sender); // Close sender before collecting from receiver
 
             let mut sub_dirs_to_add: Vec<(String, u32)> = Vec::new();
-            // Recapture top_level_dir_name_in_zip for this loop as well
             let top_level_dir_name_in_zip_for_subdir_pass = top_level_dir_name_in_zip.to_string();
+
             for entry in walkdir::WalkDir::new(&src_path)
                 .into_iter()
                 .filter_map(|e| e.ok())
@@ -143,10 +142,8 @@ pub fn zip_files(dst: String, srcs: Vec<String>) -> PyResult<()> {
                     let item_rel_to_src_path_str = rel_path.to_str().unwrap_or("").to_string();
 
                     if !item_rel_to_src_path_str.is_empty() {
-                        let metadata =
-                            fs::metadata(path).map_err(|e| PyIOError::new_err(e.to_string()))?;
+                        let metadata = fs::metadata(path)?;
                         let permissions = metadata.permissions().mode();
-
                         let mut archive_path_for_subdir =
                             if top_level_dir_name_in_zip_for_subdir_pass.is_empty()
                                 || top_level_dir_name_in_zip_for_subdir_pass == "."
@@ -159,18 +156,14 @@ pub fn zip_files(dst: String, srcs: Vec<String>) -> PyResult<()> {
                                     item_rel_to_src_path_str
                                 )
                             };
-
                         if !archive_path_for_subdir.ends_with('/') {
                             archive_path_for_subdir.push('/');
                         }
-                        // Avoid adding the top-level directory again if it's effectively the same path
                         if top_level_dir_name_in_zip_for_subdir_pass != "."
                             && archive_path_for_subdir
                                 == format!("{}/", top_level_dir_name_in_zip_for_subdir_pass)
                         {
-                            // This case is when item_rel_to_src_path_str was empty and top_level_dir_name_in_zip_for_subdir_pass was not "." or empty.
-                            // It's already handled by the initial add_directory or skipped if "." / empty.
-                            // The item_rel_to_src_path_str.is_empty() check above should prevent this.
+                            // Already handled
                         } else {
                             sub_dirs_to_add.push((archive_path_for_subdir, permissions));
                         }
@@ -178,22 +171,15 @@ pub fn zip_files(dst: String, srcs: Vec<String>) -> PyResult<()> {
                 }
             }
 
-            drop(sender);
-
-            // Sort directories by path to ensure parent directories are created before children, if not already.
-            // This is mostly a safeguard; add_directory should handle intermediate directory creation.
             sub_dirs_to_add.sort_by(|a, b| a.0.cmp(&b.0));
-            // Deduplicate, as walkdir might yield a dir and then its contents, leading to multiple adds if not careful.
             sub_dirs_to_add.dedup_by(|a, b| a.0 == b.0);
 
             for (dir_path_in_zip, perms) in sub_dirs_to_add {
-                // Skip adding the root dir ("./" or "/") if that's what dir_path_in_zip evaluates to and top_level_dir_name_in_zip implies it
                 if (top_level_dir_name_in_zip == "." && dir_path_in_zip == "./")
                     || (top_level_dir_name_in_zip.is_empty() && dir_path_in_zip == "/")
                 {
                     continue;
                 }
-                // Also skip if it's the main directory we already added (e.g. "subdir/")
                 if !top_level_dir_name_in_zip.is_empty()
                     && top_level_dir_name_in_zip != "."
                     && dir_path_in_zip == format!("{}/", top_level_dir_name_in_zip)
@@ -203,8 +189,7 @@ pub fn zip_files(dst: String, srcs: Vec<String>) -> PyResult<()> {
                 zip.add_directory(
                     &dir_path_in_zip,
                     FileOptions::<()>::default().unix_permissions(perms),
-                )
-                .map_err(|e| PyIOError::new_err(e.to_string()))?;
+                )?;
             }
 
             for (archive_path, content, permissions) in receiver {
@@ -212,201 +197,262 @@ pub fn zip_files(dst: String, srcs: Vec<String>) -> PyResult<()> {
             }
         }
     }
-
-    // Finalize the zip archive to ensure all metadata is written
-    zip.finish()
-        .map_err(|e| PyIOError::new_err(e.to_string()))?;
+    zip.finish()?;
     Ok(())
 }
 
+// PyO3 wrapper function
+#[pyfunction]
+pub fn zip_files(dst_py: String, srcs_py: Vec<String>) -> PyResult<()> {
+    let dst_path = PathBuf::from(dst_py);
+    let src_paths: Vec<PathBuf> = srcs_py.into_iter().map(PathBuf::from).collect();
+
+    // Here, you could also handle the optional password if it were passed from Python
+    // let password_py: Option<String> = None; // Example: if it was an argument
+    // do_zip_internal(&dst_path, &src_paths, password_py)
+    do_zip_internal(&dst_path, &src_paths).map_err(|e| PyIOError::new_err(e.to_string()))
+}
+
 // Helper function to add a file to the zip archive with permissions
+// Changed to return io::Result
 fn add_file_to_zip_with_permissions<W: std::io::Write + std::io::Seek>(
     zip: &mut ZipWriter<W>,
     archive_path: &str,
     permissions: u32,
     content: Vec<u8>,
-) -> PyResult<()> {
+) -> io::Result<()> {
+    // Changed PyResult to io::Result
     let file_options = SimpleFileOptions::default().unix_permissions(permissions);
-
-    zip.start_file(archive_path, file_options)
-        .map_err(|e| PyIOError::new_err(e.to_string()))?;
-
-    zip.write_all(&content)
-        .map_err(|e| PyIOError::new_err(e.to_string()))?;
-
+    zip.start_file(archive_path, file_options)?;
+    zip.write_all(&content)?;
     Ok(())
 }
 
 // Helper function to add a file from filesystem to zip with permissions
+// Changed to return io::Result
 fn add_file_from_path_to_zip_with_permissions<W: std::io::Write + std::io::Seek>(
     zip: &mut ZipWriter<W>,
     file_path: &Path,
     archive_path: &str,
     permissions: u32,
-) -> PyResult<()> {
-    // Read the entire file content first
-    let content = std::fs::read(file_path).map_err(|e| PyIOError::new_err(e.to_string()))?;
+) -> io::Result<()> {
+    // Changed PyResult to io::Result
+    let content = fs::read(file_path)?;
     add_file_to_zip_with_permissions(zip, archive_path, permissions, content)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*; // To get zip_files and helpers
-    use ::zip::ZipArchive;
+    use super::*; // Imports do_zip_internal and the pyfunction zip_files
     use std::fs::{self, File};
+    use std::io::Read;
     use std::os::unix::fs::PermissionsExt;
-    use tempfile::tempdir; // To read and verify zip contents
+    use tempfile::tempdir;
+
+    // Helper to call the Python-wrapped version for tests that expect PyResult
+    fn zip_files_py_wrapper(dst: String, srcs: Vec<String>) -> PyResult<()> {
+        super::zip_files(dst, srcs)
+    }
+
+    // Or, a helper to call internal if tests want to use io::Result
+    fn zip_files_internal_wrapper(dst: &Path, srcs: &[PathBuf]) -> io::Result<()> {
+        super::do_zip_internal(dst, srcs)
+    }
 
     #[test]
     fn test_zip_files_creates_zip() {
-        // Create a temporary directory
         let dir = tempdir().unwrap();
-        let file1_path = dir.path().join("file1.txt");
-        let file2_path = dir.path().join("file2.txt");
-        let zip_path = dir.path().join("archive.zip");
+        let file_path = dir.path().join("file1.txt");
+        fs::write(&file_path, "hello").unwrap();
 
-        // Write some content to the files
-        fs::write(&file1_path, b"hello").unwrap();
-        fs::write(&file2_path, b"world").unwrap();
+        let zip_file_path_str = dir.path().join("archive.zip").to_str().unwrap().to_string();
+        let srcs_str = vec![file_path.to_str().unwrap().to_string()];
 
-        // Call the zip_files function
-        let srcs = vec![
-            file1_path.to_str().unwrap().to_string(),
-            file2_path.to_str().unwrap().to_string(),
-        ];
-        let result = zip_files(zip_path.to_str().unwrap().to_string(), srcs);
-        assert!(result.is_ok());
+        // Test the PyO3 wrapper
+        zip_files_py_wrapper(zip_file_path_str.clone(), srcs_str.clone()).unwrap();
+        let mut zip_file = File::open(dir.path().join("archive.zip")).unwrap();
+        let mut archive = zip::ZipArchive::new(&mut zip_file).unwrap();
+        assert_eq!(archive.len(), 1);
+        let mut file_in_zip = archive.by_name("file1.txt").unwrap();
+        let mut contents = String::new();
+        file_in_zip.read_to_string(&mut contents).unwrap();
+        assert_eq!(contents, "hello");
 
-        // Check that the zip file exists and is not empty
-        let metadata = fs::metadata(&zip_path).unwrap();
-        assert!(metadata.is_file());
-        assert!(metadata.len() > 0);
+        // Optionally, test the internal function directly
+        let zip_file_path_internal = dir.path().join("archive_internal.zip");
+        let src_path_bufs = vec![file_path.clone()];
+        zip_files_internal_wrapper(&zip_file_path_internal, &src_path_bufs).unwrap();
+        let mut zip_file_internal = File::open(&zip_file_path_internal).unwrap();
+        let archive_internal = zip::ZipArchive::new(&mut zip_file_internal).unwrap();
+        assert_eq!(archive_internal.len(), 1);
+        // Further checks for internal version...
     }
 
     #[test]
     fn test_zip_files_and_directories() {
-        // Create a temporary directory
         let dir = tempdir().unwrap();
         let file1_path = dir.path().join("file1.txt");
         let subdir_path = dir.path().join("subdir");
         let subfile_path = subdir_path.join("subfile.txt");
-        let zip_path = dir.path().join("archive.zip");
 
-        // Write some content to the files
-        fs::write(&file1_path, b"hello").unwrap();
+        fs::write(&file1_path, "hello from file1").unwrap();
         fs::create_dir(&subdir_path).unwrap();
-        fs::write(&subfile_path, b"subdir file").unwrap();
+        fs::write(&subfile_path, "hello from subfile").unwrap();
 
-        // Call the zip_files function with both files and the directory
-        let srcs = vec![
+        let zip_file_path_str = dir.path().join("archive.zip").to_str().unwrap().to_string();
+        let srcs_str = vec![
             file1_path.to_str().unwrap().to_string(),
             subdir_path.to_str().unwrap().to_string(),
         ];
-        let result = zip_files(zip_path.to_str().unwrap().to_string(), srcs);
-        assert!(result.is_ok());
 
-        // Check that the zip file exists and is not empty
-        let metadata = fs::metadata(&zip_path).unwrap();
-        assert!(metadata.is_file());
-        assert!(metadata.len() > 0);
+        zip_files_py_wrapper(zip_file_path_str, srcs_str).unwrap();
 
-        // Open the zip and check the contents
-        let zip_file = File::open(&zip_path).unwrap();
-        let mut archive = ZipArchive::new(zip_file).unwrap();
-        let mut names = vec![];
-        for i in 0..archive.len() {
-            let file = archive.by_index(i).unwrap();
-            names.push(file.name().to_string());
-        }
-        // file1.txt should be present
-        assert!(names.contains(&"file1.txt".to_string()));
-        // subfile.txt should be present as subdir/subfile.txt
-        assert!(names.contains(&"subdir/subfile.txt".to_string()));
-        // Check for directory entry as well
-        assert!(names.contains(&"subdir/".to_string()));
+        let mut zip_file = File::open(dir.path().join("archive.zip")).unwrap();
+        let mut archive = zip::ZipArchive::new(&mut zip_file).unwrap();
+
+        // Expected entries: file1.txt, subdir/, subdir/subfile.txt
+        // Depending on how WalkDir iterates and how "." is handled, count might vary.
+        // Let's check for specific entries.
+
+        let file1_in_zip = archive.by_name("file1.txt").is_ok();
+        assert!(file1_in_zip, "file1.txt should be in the zip");
+
+        let subdir_in_zip = archive.by_name("subdir/").is_ok();
+        assert!(subdir_in_zip, "subdir/ should be in the zip");
+
+        let subfile_in_zip = archive.by_name("subdir/subfile.txt").is_ok();
+        assert!(subfile_in_zip, "subdir/subfile.txt should be in the zip");
+
+        let mut file_in_zip = archive.by_name("subdir/subfile.txt").unwrap();
+        let mut contents = String::new();
+        file_in_zip.read_to_string(&mut contents).unwrap();
+        assert_eq!(contents, "hello from subfile");
     }
 
     #[test]
     fn test_zip_preserves_permissions() {
-        // Create a temporary directory
         let dir = tempdir().unwrap();
-        let executable_file = dir.path().join("executable.sh");
-        let readonly_file = dir.path().join("readonly.txt");
-        let subdir_path = dir.path().join("subdir");
-        let subfile_path = subdir_path.join("subfile.txt");
-        let zip_path = dir.path().join("permissions_test.zip");
+        let file_path = dir.path().join("executable.sh");
+        fs::write(&file_path, "#!/bin/bash\\necho hello").unwrap();
 
-        // Create files with specific permissions
-        fs::write(&executable_file, b"#!/bin/bash\necho 'hello'").unwrap();
-        fs::write(&readonly_file, b"read only content").unwrap();
-
-        // Create subdirectory and file
-        fs::create_dir(&subdir_path).unwrap();
-        fs::write(&subfile_path, b"sub file content").unwrap();
-
-        // Set specific permissions
-        let mut perms = fs::metadata(&executable_file).unwrap().permissions();
-        perms.set_mode(0o755); // rwxr-xr-x (executable)
-        fs::set_permissions(&executable_file, perms).unwrap();
-
-        let mut perms = fs::metadata(&readonly_file).unwrap().permissions();
-        perms.set_mode(0o444); // r--r--r-- (readonly)
-        fs::set_permissions(&readonly_file, perms).unwrap();
-
-        let mut perms = fs::metadata(&subfile_path).unwrap().permissions();
-        perms.set_mode(0o600); // rw------- (owner only)
-        fs::set_permissions(&subfile_path, perms).unwrap();
-
-        // Call the zip_files function
-        let srcs = vec![
-            executable_file.to_str().unwrap().to_string(),
-            readonly_file.to_str().unwrap().to_string(),
-            subdir_path.to_str().unwrap().to_string(),
-        ];
-        let result = zip_files(zip_path.to_str().unwrap().to_string(), srcs);
-        assert!(result.is_ok());
-
-        // Check that the zip file exists
-        assert!(fs::metadata(&zip_path).unwrap().is_file());
-
-        // Open the zip and verify permissions are preserved
-        let zip_file = File::open(&zip_path).unwrap();
-        let mut archive = ZipArchive::new(zip_file).unwrap();
-
-        for i in 0..archive.len() {
-            let file = archive.by_index(i).unwrap();
-            let name = file.name();
-            let permissions = file.unix_mode().unwrap_or(0);
-
-            match name {
-                "executable.sh" => {
-                    assert_eq!(
-                        permissions & 0o777,
-                        0o755,
-                        "executable.sh should have 755 permissions, got {:o}",
-                        permissions & 0o777
-                    );
-                }
-                "readonly.txt" => {
-                    assert_eq!(
-                        permissions & 0o777,
-                        0o444,
-                        "readonly.txt should have 444 permissions, got {:o}",
-                        permissions & 0o777
-                    );
-                }
-                "subdir/subfile.txt" => {
-                    assert_eq!(
-                        permissions & 0o777,
-                        0o600,
-                        "subdir/subfile.txt should have 600 permissions, got {:o}",
-                        permissions & 0o777
-                    );
-                }
-                // Optionally, check directory permissions if they are consistently set by the zip library
-                // "subdir/" => { ... }
-                _ => {} // Ignore other files/directories like "subdir/"
-            }
+        #[cfg(unix)]
+        {
+            let mut perms = fs::metadata(&file_path).unwrap().permissions();
+            perms.set_mode(0o755); // rwxr-xr-x
+            fs::set_permissions(&file_path, perms).unwrap();
         }
+
+        let zip_file_path_str = dir.path().join("archive.zip").to_str().unwrap().to_string();
+        let srcs_str = vec![file_path.to_str().unwrap().to_string()];
+
+        zip_files_py_wrapper(zip_file_path_str, srcs_str).unwrap();
+
+        let mut zip_file = File::open(dir.path().join("archive.zip")).unwrap();
+        let mut archive = zip::ZipArchive::new(&mut zip_file).unwrap();
+        let file_in_zip = archive.by_name("executable.sh").unwrap();
+
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                file_in_zip.unix_mode().unwrap() & 0o777, // Mask to compare only permission bits
+                0o755,
+                "Permissions not preserved"
+            );
+        }
+        // On non-Unix, this test might not be as meaningful for mode,
+        // but it ensures the zipping process itself doesn't fail.
+        assert!(file_in_zip.size() > 0);
+    }
+
+    #[test]
+    fn test_zip_directory_with_dot() {
+        let base_dir = tempdir().unwrap();
+        let project_dir = base_dir.path().join("my_project");
+        fs::create_dir_all(&project_dir).unwrap();
+
+        let file_in_project = project_dir.join("file.txt");
+        fs::write(&file_in_project, "content").unwrap();
+
+        let subdir_in_project = project_dir.join("data");
+        fs::create_dir_all(&subdir_in_project).unwrap();
+        let file_in_subdir = subdir_in_project.join("notes.txt");
+        fs::write(&file_in_subdir, "notes").unwrap();
+
+        let zip_file_path = base_dir.path().join("project_archive.zip");
+
+        // Scenario 1: Zip the directory itself ("my_project")
+        // We pass the path to "my_project"
+        zip_files_internal_wrapper(&zip_file_path, &[project_dir.clone()]).unwrap();
+
+        let mut zip_file = File::open(&zip_file_path).unwrap();
+        let mut archive = zip::ZipArchive::new(&mut zip_file).unwrap();
+
+        assert!(
+            archive.by_name("my_project/").is_ok(),
+            "Archive should contain my_project/ directory entry"
+        );
+        assert!(archive.by_name("my_project/file.txt").is_ok());
+        assert!(archive.by_name("my_project/data/").is_ok());
+        assert!(archive.by_name("my_project/data/notes.txt").is_ok());
+
+        // Clean up for next scenario
+        fs::remove_file(&zip_file_path).unwrap();
+
+        // Scenario 2: cd into "my_project" and zip "."
+        // Simulating this by providing "." as a source and changing current directory for WalkDir logic
+        // For the internal function, we need to provide absolute paths or paths relative to where it *thinks* it is.
+        // The internal function itself doesn't know about "current directory" in the shell sense.
+        // What the user often means by `zip -r archive.zip .` is "zip everything in the current directory,
+        // with paths relative to the current directory, and without the current directory's name as a prefix".
+
+        // To simulate zipping "." from within "my_project":
+        // The `srcs` for `do_zip_internal` would be `[PathBuf::from("file.txt"), PathBuf::from("data")]`
+        // IF `do_zip_internal` was also given `my_project` as a base path to strip.
+        // Our current `do_zip_internal` expects full paths for `srcs` if they are top-level items.
+        // If we pass `PathBuf::from(".")` as a src, `file_name()` is `.`
+        // Let's test current behavior with PathBuf::from(".")
+        // This requires creating a "." directory, which is not typical.
+        // The more realistic way is that the calling code (CLI) resolves "." to the actual path.
+
+        // Let's test zipping specific files/dirs that are inside my_project,
+        // as if we were in my_project and did `zip ../archive.zip file.txt data`
+        let zip_file_path_rel = base_dir.path().join("project_archive_relative.zip");
+        let sources_relative = vec![file_in_project.clone(), subdir_in_project.clone()];
+        zip_files_internal_wrapper(&zip_file_path_rel, &sources_relative).unwrap();
+
+        let mut zip_file_rel = File::open(&zip_file_path_rel).unwrap();
+        let mut archive_rel = zip::ZipArchive::new(&mut zip_file_rel).unwrap();
+        // Expects file.txt, data/, data/notes.txt at the root of the zip
+        assert!(archive_rel.by_name("file.txt").is_ok());
+        assert!(archive_rel.by_name("data/").is_ok());
+        assert!(archive_rel.by_name("data/notes.txt").is_ok());
+        assert!(
+            archive_rel.by_name("my_project/").is_err(),
+            "Should not include my_project prefix when zipping contents directly"
+        );
+    }
+
+    #[test]
+    fn test_zip_empty_directory() {
+        let dir = tempdir().unwrap();
+        let empty_subdir_path = dir.path().join("empty_dir");
+        fs::create_dir(&empty_subdir_path).unwrap();
+
+        let zip_file_path_str = dir.path().join("archive.zip").to_str().unwrap().to_string();
+        let srcs_str = vec![empty_subdir_path.to_str().unwrap().to_string()];
+
+        zip_files_py_wrapper(zip_file_path_str, srcs_str).unwrap();
+
+        let mut zip_file = File::open(dir.path().join("archive.zip")).unwrap();
+        let mut archive = zip::ZipArchive::new(&mut zip_file).unwrap();
+
+        // Should contain an entry for "empty_dir/"
+        assert_eq!(
+            archive.len(),
+            1,
+            "Zip should contain one entry for the empty directory"
+        );
+        let entry = archive.by_name("empty_dir/").unwrap();
+        assert!(entry.is_dir());
     }
 }

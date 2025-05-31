@@ -2,11 +2,11 @@
 use pyo3::prelude::*;
 // Unused imports PyIOError, File, Write, PermissionsExt, Path, PathBuf, fs were removed.
 
-mod unzip;
-mod zip; // Declare the new zip module
+pub mod unzip;
+pub mod zip; // Declare the new zip module
 
-pub use unzip::unzip_files;
-pub use zip::zip_files; // Publicly re-export zip_files
+pub use unzip::unzip_files; // This is for the Python interface
+pub use zip::zip_files; // This is for the Python interface
 
 // The zip_files function, its helpers, and SimpleFileOptions alias have been moved to src/zip.rs
 
