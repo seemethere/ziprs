@@ -1,3 +1,5 @@
+use crate::zip::zip_files_pywrapper as zip_files_py_wrapper;
+use crate::zip::{zip_files, Compression};
 use pyo3::exceptions::PyIOError;
 use pyo3::prelude::*;
 use rayon::prelude::*;
@@ -148,7 +150,7 @@ pub fn unzip_files_pywrapper(src_py: String, dst_py: String) -> PyResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*; // For unzip_files (PyO3 wrapper) and do_unzip_internal
-    use crate::zip::zip_files_pywrapper as zip_files_py_wrapper;
+    use crate::zip::{zip_files, Compression};
     use std::fs::{self};
     use std::io::Read as StdRead;
     use std::os::unix::fs::PermissionsExt as OsUnixPermissionsExt;
@@ -188,12 +190,15 @@ mod tests {
         OsUnixPermissionsExt::set_mode(&mut perms_subfile, 0o755);
         fs::set_permissions(&subfile_path, perms_subfile).unwrap();
 
-        let srcs_to_zip = vec![
+        let srcs_to_zip_str = vec![
             file1_path.to_str().unwrap().to_string(),
             subdir_path.to_str().unwrap().to_string(),
         ];
-        // Call the PyO3 wrapper for zipping from the zip module (via lib.rs)
-        zip_files_py_wrapper(zip_file_path.to_str().unwrap().to_string(), srcs_to_zip).unwrap();
+        let srcs_to_zip_pathbuf: Vec<PathBuf> =
+            srcs_to_zip_str.into_iter().map(PathBuf::from).collect();
+
+        // Call the internal zip_files function directly
+        zip_files(&zip_file_path, &srcs_to_zip_pathbuf, Compression::default()).unwrap();
 
         // Test the PyO3 wrapper for unzipping
         unzip_files_py_wrapper_local(
@@ -253,8 +258,11 @@ mod tests {
 
         let file1_path = original_dir.path().join("dummy.txt");
         fs::write(&file1_path, "dummy content").unwrap();
-        let srcs_to_zip = vec![file1_path.to_str().unwrap().to_string()];
-        zip_files_py_wrapper(zip_file_path.to_str().unwrap().to_string(), srcs_to_zip).unwrap();
+        let srcs_to_zip_str = vec![file1_path.to_str().unwrap().to_string()];
+        let srcs_to_zip_pathbuf: Vec<PathBuf> =
+            srcs_to_zip_str.into_iter().map(PathBuf::from).collect();
+
+        zip_files(&zip_file_path, &srcs_to_zip_pathbuf, Compression::default()).unwrap();
 
         let result = unzip_files_py_wrapper_local(
             zip_file_path.to_str().unwrap().to_string(),
@@ -274,8 +282,10 @@ mod tests {
         let empty_dir_src = original_dir.path().join("empty_folder");
         fs::create_dir(&empty_dir_src).unwrap();
 
-        let srcs_to_zip = vec![empty_dir_src.to_str().unwrap().to_string()];
-        zip_files_py_wrapper(zip_file_path.to_str().unwrap().to_string(), srcs_to_zip).unwrap();
+        let srcs_to_zip_str = vec![empty_dir_src.to_str().unwrap().to_string()];
+        let srcs_to_zip_pathbuf: Vec<PathBuf> =
+            srcs_to_zip_str.into_iter().map(PathBuf::from).collect();
+        zip_files(&zip_file_path, &srcs_to_zip_pathbuf, Compression::default()).unwrap();
 
         unzip_files_py_wrapper_local(
             zip_file_path.to_str().unwrap().to_string(),

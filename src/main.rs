@@ -1,7 +1,10 @@
 use clap::Parser;
 use std::path::PathBuf;
 
-use ziprs::{unzip::unzip_files, zip::zip_files};
+use ziprs::{
+    unzip::unzip_files,
+    zip::{zip_files, Compression},
+};
 
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
@@ -21,6 +24,10 @@ enum Commands {
         /// Output zip file path
         #[clap(short, long)]
         output_path: PathBuf,
+
+        /// Compression method to use
+        #[clap(short, long)]
+        compression: Compression,
     },
     /// Unzips a specified archive
     Unzip {
@@ -41,9 +48,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Zip {
             input_paths,
             output_path,
+            compression,
         } => {
             println!("Zipping {:?} to {:?}...", input_paths, output_path);
-            zip_files(&output_path, &input_paths)
+            zip_files(&output_path, &input_paths, compression)
                 .map_err(|e| format!("Failed to zip files: {}", e))?;
             println!("Successfully zipped files to {}.\n", output_path.display());
         }

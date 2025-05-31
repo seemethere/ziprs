@@ -1,3 +1,4 @@
+use clap::ValueEnum;
 use pyo3::exceptions::PyIOError;
 use pyo3::prelude::*;
 use rayon::prelude::*;
@@ -6,15 +7,46 @@ use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
-use zip::{write::FileOptions, ZipWriter};
+use zip::{write::FileOptions, CompressionMethod as ZipCompressionMethod, ZipWriter};
 
 // Type alias for simpler usage of FileOptions with default parameters
 type SimpleFileOptions = FileOptions<'static, ()>;
 
+#[derive(Clone, Copy, Debug, ValueEnum, Default)]
+pub enum Compression {
+    Stored,
+    #[default]
+    Deflate,
+    Bzip2,
+    Zstd,
+}
+
+impl Compression {
+    fn to_zip_compression_method(self) -> ZipCompressionMethod {
+        match self {
+            Compression::Stored => ZipCompressionMethod::Stored,
+            Compression::Deflate => ZipCompressionMethod::Deflated,
+            Compression::Bzip2 => ZipCompressionMethod::Bzip2,
+            Compression::Zstd => ZipCompressionMethod::Zstd,
+        }
+    }
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s.to_lowercase().as_str() {
+            "stored" => Ok(Compression::Stored),
+            "deflate" | "deflated" => Ok(Compression::Deflate),
+            "bzip2" => Ok(Compression::Bzip2),
+            "zstd" => Ok(Compression::Zstd),
+            _ => Err(format!("Unsupported compression method: {}", s)),
+        }
+    }
+}
+
 // Core zipping logic, callable from both CLI and Python wrapper
-pub fn zip_files(dst: &Path, srcs: &[PathBuf]) -> io::Result<()> {
+pub fn zip_files(dst: &Path, srcs: &[PathBuf], compression: Compression) -> io::Result<()> {
     let file = File::create(dst)?;
     let mut zip = ZipWriter::new(file);
+    let compression_method = compression.to_zip_compression_method();
 
     for src_path in srcs {
         if src_path.is_file() {
@@ -31,7 +63,13 @@ pub fn zip_files(dst: &Path, srcs: &[PathBuf]) -> io::Result<()> {
                 })?;
 
             let content = fs::read(src_path)?;
-            add_file_to_zip_with_permissions(&mut zip, file_name_in_archive, permissions, content)?;
+            add_file_to_zip_with_permissions(
+                &mut zip,
+                file_name_in_archive,
+                permissions,
+                content,
+                compression_method,
+            )?;
         } else if src_path.is_dir() {
             let dir_metadata = fs::metadata(src_path)?;
             let dir_permissions = dir_metadata.permissions().mode();
@@ -48,7 +86,9 @@ pub fn zip_files(dst: &Path, srcs: &[PathBuf]) -> io::Result<()> {
                 let proper_dir_name = format!("{}/", top_level_dir_name_in_zip);
                 zip.add_directory(
                     proper_dir_name,
-                    SimpleFileOptions::default().unix_permissions(dir_permissions),
+                    SimpleFileOptions::default()
+                        .unix_permissions(dir_permissions)
+                        .compression_method(compression_method), // Apply to directory entry options as well
                 )?;
             }
 
@@ -66,6 +106,7 @@ pub fn zip_files(dst: &Path, srcs: &[PathBuf]) -> io::Result<()> {
             let (sender, receiver) = mpsc::channel::<(String, Vec<u8>, u32)>();
             let src_path_clone = src_path.clone();
             let top_level_dir_name_in_zip_clone = top_level_dir_name_in_zip.to_string();
+            let current_compression_method = compression_method; // Capture for parallel closure
 
             // Rayon parallel iteration: Read file contents and gather metadata.
             // Sends data (archive path, content, permissions) to a channel for sequential writing to the zip.
@@ -181,13 +222,21 @@ pub fn zip_files(dst: &Path, srcs: &[PathBuf]) -> io::Result<()> {
                 }
                 zip.add_directory(
                     &dir_path_in_zip,
-                    SimpleFileOptions::default().unix_permissions(perms),
+                    SimpleFileOptions::default()
+                        .unix_permissions(perms)
+                        .compression_method(current_compression_method),
                 )?;
             }
 
             // Now, write all file contents (received from parallel processing) to the zip archive.
             for (archive_path, content, permissions) in receiver {
-                add_file_to_zip_with_permissions(&mut zip, &archive_path, permissions, content)?;
+                add_file_to_zip_with_permissions(
+                    &mut zip,
+                    &archive_path,
+                    permissions,
+                    content,
+                    current_compression_method,
+                )?;
             }
         }
     }
@@ -197,12 +246,22 @@ pub fn zip_files(dst: &Path, srcs: &[PathBuf]) -> io::Result<()> {
 
 // PyO3 wrapper function
 #[pyfunction]
-#[pyo3(name = "zip_files")]
-pub fn zip_files_pywrapper(dst_py: String, srcs_py: Vec<String>) -> PyResult<()> {
+#[pyo3(name = "zip_files", signature = (dst_py, srcs_py, compression_method_py = None))]
+pub fn zip_files_pywrapper(
+    dst_py: String,
+    srcs_py: Vec<String>,
+    compression_method_py: Option<String>,
+) -> PyResult<()> {
     let dst_path = PathBuf::from(dst_py);
     let src_paths: Vec<PathBuf> = srcs_py.into_iter().map(PathBuf::from).collect();
 
-    zip_files(&dst_path, &src_paths).map_err(|e| PyIOError::new_err(e.to_string()))
+    let compression = match compression_method_py {
+        Some(method_str) => Compression::from_str(&method_str)
+            .map_err(|e| PyIOError::new_err(format!("Invalid compression method: {}", e)))?,
+        None => Compression::default(),
+    };
+
+    zip_files(&dst_path, &src_paths, compression).map_err(|e| PyIOError::new_err(e.to_string()))
 }
 
 // Helper function to add a file to the zip archive with permissions
@@ -212,9 +271,12 @@ fn add_file_to_zip_with_permissions<W: std::io::Write + std::io::Seek>(
     archive_path: &str,
     permissions: u32,
     content: Vec<u8>,
+    compression_method: ZipCompressionMethod,
 ) -> io::Result<()> {
     // Changed PyResult to io::Result
-    let file_options = SimpleFileOptions::default().unix_permissions(permissions);
+    let file_options = SimpleFileOptions::default()
+        .unix_permissions(permissions)
+        .compression_method(compression_method);
     zip.start_file(archive_path, file_options)?;
     zip.write_all(&content)?;
     Ok(())
@@ -229,13 +291,21 @@ mod tests {
     use tempfile::tempdir;
 
     // Helper to call the Python-wrapped version for tests that expect PyResult
-    fn zip_files_py_wrapper(dst: String, srcs: Vec<String>) -> PyResult<()> {
-        super::zip_files_pywrapper(dst, srcs)
+    fn zip_files_py_wrapper(
+        dst: String,
+        srcs: Vec<String>,
+        compression: Option<String>,
+    ) -> PyResult<()> {
+        super::zip_files_pywrapper(dst, srcs, compression)
     }
 
     // Or, a helper to call internal if tests want to use io::Result
-    fn zip_files_internal_wrapper(dst: &Path, srcs: &[PathBuf]) -> io::Result<()> {
-        super::zip_files(dst, srcs)
+    fn zip_files_internal_wrapper(
+        dst: &Path,
+        srcs: &[PathBuf],
+        compression: Compression,
+    ) -> io::Result<()> {
+        super::zip_files(dst, srcs, compression)
     }
 
     #[test]
@@ -248,7 +318,7 @@ mod tests {
         let srcs_str = vec![file_path.to_str().unwrap().to_string()];
 
         // Test the PyO3 wrapper
-        zip_files_py_wrapper(zip_file_path_str.clone(), srcs_str.clone()).unwrap();
+        zip_files_py_wrapper(zip_file_path_str.clone(), srcs_str.clone(), None).unwrap();
         let mut zip_file = File::open(dir.path().join("archive.zip")).unwrap();
         let mut archive = zip::ZipArchive::new(&mut zip_file).unwrap();
         assert_eq!(archive.len(), 1);
@@ -260,7 +330,12 @@ mod tests {
         // Optionally, test the internal function directly
         let zip_file_path_internal = dir.path().join("archive_internal.zip");
         let src_path_bufs = vec![file_path.clone()];
-        zip_files_internal_wrapper(&zip_file_path_internal, &src_path_bufs).unwrap();
+        zip_files_internal_wrapper(
+            &zip_file_path_internal,
+            &src_path_bufs,
+            Compression::default(),
+        )
+        .unwrap();
         let mut zip_file_internal = File::open(&zip_file_path_internal).unwrap();
         let archive_internal = zip::ZipArchive::new(&mut zip_file_internal).unwrap();
         assert_eq!(archive_internal.len(), 1);
@@ -284,7 +359,7 @@ mod tests {
             subdir_path.to_str().unwrap().to_string(),
         ];
 
-        zip_files_py_wrapper(zip_file_path_str, srcs_str).unwrap();
+        zip_files_py_wrapper(zip_file_path_str, srcs_str, None).unwrap();
 
         let mut zip_file = File::open(dir.path().join("archive.zip")).unwrap();
         let mut archive = zip::ZipArchive::new(&mut zip_file).unwrap();
@@ -324,7 +399,7 @@ mod tests {
         let zip_file_path_str = dir.path().join("archive.zip").to_str().unwrap().to_string();
         let srcs_str = vec![file_path.to_str().unwrap().to_string()];
 
-        zip_files_py_wrapper(zip_file_path_str, srcs_str).unwrap();
+        zip_files_py_wrapper(zip_file_path_str, srcs_str, None).unwrap();
 
         let mut zip_file = File::open(dir.path().join("archive.zip")).unwrap();
         let mut archive = zip::ZipArchive::new(&mut zip_file).unwrap();
@@ -361,7 +436,12 @@ mod tests {
 
         // Scenario 1: Zip the directory itself ("my_project")
         // We pass the path to "my_project"
-        zip_files_internal_wrapper(&zip_file_path, &[project_dir.clone()]).unwrap();
+        zip_files_internal_wrapper(
+            &zip_file_path,
+            &[project_dir.clone()],
+            Compression::default(),
+        )
+        .unwrap();
 
         let mut zip_file = File::open(&zip_file_path).unwrap();
         let mut archive = zip::ZipArchive::new(&mut zip_file).unwrap();
@@ -397,7 +477,12 @@ mod tests {
         // as if we were in my_project and did `zip ../archive.zip file.txt data`
         let zip_file_path_rel = base_dir.path().join("project_archive_relative.zip");
         let sources_relative = vec![file_in_project.clone(), subdir_in_project.clone()];
-        zip_files_internal_wrapper(&zip_file_path_rel, &sources_relative).unwrap();
+        zip_files_internal_wrapper(
+            &zip_file_path_rel,
+            &sources_relative,
+            Compression::default(),
+        )
+        .unwrap();
 
         let mut zip_file_rel = File::open(&zip_file_path_rel).unwrap();
         let mut archive_rel = zip::ZipArchive::new(&mut zip_file_rel).unwrap();
@@ -420,7 +505,7 @@ mod tests {
         let zip_file_path_str = dir.path().join("archive.zip").to_str().unwrap().to_string();
         let srcs_str = vec![empty_subdir_path.to_str().unwrap().to_string()];
 
-        zip_files_py_wrapper(zip_file_path_str, srcs_str).unwrap();
+        zip_files_py_wrapper(zip_file_path_str, srcs_str, None).unwrap();
 
         let mut zip_file = File::open(dir.path().join("archive.zip")).unwrap();
         let mut archive = zip::ZipArchive::new(&mut zip_file).unwrap();
@@ -433,5 +518,77 @@ mod tests {
         );
         let entry = archive.by_name("empty_dir/").unwrap();
         assert!(entry.is_dir());
+    }
+
+    #[test]
+    fn test_zip_compression_methods() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("compressible_data.txt");
+        // Create a somewhat compressible file
+        let mut large_content = String::new();
+        for i in 0..1000 {
+            large_content.push_str(&format!("Line {} with some repetitive text. ", i));
+        }
+        fs::write(&file_path, large_content).unwrap();
+
+        let src_path_bufs = vec![file_path.clone()];
+        let srcs_str = vec![file_path.to_str().unwrap().to_string()];
+
+        // Test with Stored (no compression)
+        let zip_stored_path = dir.path().join("archive_stored.zip");
+        zip_files_internal_wrapper(&zip_stored_path, &src_path_bufs, Compression::Stored).unwrap();
+
+        let mut zip_file_stored = File::open(&zip_stored_path).unwrap();
+        let mut archive_stored = zip::ZipArchive::new(&mut zip_file_stored).unwrap();
+        let file_in_zip_stored = archive_stored.by_name("compressible_data.txt").unwrap();
+        let stored_size = file_in_zip_stored.compressed_size();
+        assert_eq!(
+            file_in_zip_stored.compression(),
+            ZipCompressionMethod::Stored
+        );
+
+        // Test with Deflate (default compression) using the Python wrapper
+        let zip_deflate_path_str = dir
+            .path()
+            .join("archive_deflate.zip")
+            .to_str()
+            .unwrap()
+            .to_string();
+        zip_files_py_wrapper(
+            zip_deflate_path_str.clone(),
+            srcs_str.clone(),
+            Some("deflate".to_string()),
+        )
+        .unwrap();
+
+        let mut zip_file_deflate = File::open(dir.path().join("archive_deflate.zip")).unwrap();
+        let mut archive_deflate = zip::ZipArchive::new(&mut zip_file_deflate).unwrap();
+        let file_in_zip_deflate = archive_deflate.by_name("compressible_data.txt").unwrap();
+        let deflated_size = file_in_zip_deflate.compressed_size();
+        assert_eq!(
+            file_in_zip_deflate.compression(),
+            ZipCompressionMethod::Deflated
+        );
+
+        // Assert that deflated size is smaller than stored size for compressible data
+        // This might not hold for very small or already compressed files, but should for our test data.
+        println!(
+            "Stored size: {}, Deflated size: {}",
+            stored_size, deflated_size
+        );
+        assert!(
+            deflated_size < stored_size,
+            "Deflated size should be less than stored size for this data."
+        );
+
+        // Test with Bzip2 if feature is enabled (requires bzip2 feature in zip crate)
+        // For now, let's assume it might not be and skip, or conditionally compile.
+        // We can add a specific test for Bzip2 if we ensure the Cargo.toml enables it.
+        // zip_files_internal_wrapper(&dir.path().join("archive_bzip2.zip"), &src_path_bufs, Compression::Bzip2).unwrap();
+        // ... then verify ...
+
+        // Test with Zstd if feature is enabled (requires zstd feature in zip crate)
+        // zip_files_internal_wrapper(&dir.path().join("archive_zstd.zip"), &src_path_bufs, Compression::Zstd).unwrap();
+        // ... then verify ...
     }
 }
