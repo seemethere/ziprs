@@ -11,14 +11,11 @@ use zip::ZipArchive;
 pub fn unzip_files(src_path: &Path, dst_path: &Path) -> io::Result<()> {
     if !dst_path.exists() {
         fs::create_dir_all(dst_path).map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                format!(
-                    "Failed to create destination directory '{}': {}",
-                    dst_path.display(),
-                    e
-                ),
-            )
+            io::Error::other(format!(
+                "Failed to create destination directory '{}': {}",
+                dst_path.display(),
+                e
+            ))
         })?;
     }
 
@@ -61,14 +58,11 @@ pub fn unzip_files(src_path: &Path, dst_path: &Path) -> io::Result<()> {
         } else {
             let mut content = Vec::new();
             file_in_zip.read_to_end(&mut content).map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::Other,
-                    format!(
-                        "Failed to read file content from zip entry '{}': {}",
-                        file_in_zip.name(),
-                        e
-                    ),
-                )
+                io::Error::other(format!(
+                    "Failed to read file content from zip entry '{}': {}",
+                    file_in_zip.name(),
+                    e
+                ))
             })?;
             let mode = file_in_zip.unix_mode();
             files_to_extract.push((outpath, content, mode));
@@ -80,14 +74,11 @@ pub fn unzip_files(src_path: &Path, dst_path: &Path) -> io::Result<()> {
     // with file extractions, especially for nested structures.
     for dir_path in dirs_to_create {
         fs::create_dir_all(&dir_path).map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                format!(
-                    "Failed to create directory structure at '{}': {}",
-                    dir_path.display(),
-                    e
-                ),
-            )
+            io::Error::other(format!(
+                "Failed to create directory structure at '{}': {}",
+                dir_path.display(),
+                e
+            ))
         })?;
     }
 
@@ -103,43 +94,39 @@ pub fn unzip_files(src_path: &Path, dst_path: &Path) -> io::Result<()> {
             if let Some(p) = path.parent() {
                 if !p.exists() {
                     fs::create_dir_all(p).map_err(|e| {
-                        io::Error::new(
-                            io::ErrorKind::Other,
-                            format!(
-                                "Failed to create parent directory for file '{}': {}",
-                                path.display(),
-                                e
-                            ),
-                        )
+                        io::Error::other(format!(
+                            "Failed to create parent directory for file '{}': {}",
+                            path.display(),
+                            e
+                        ))
                     })?;
                 }
             }
 
             let mut outfile = fs::File::create(path).map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("Failed to create output file '{}': {}", path.display(), e),
-                )
+                io::Error::other(format!(
+                    "Failed to create output file '{}': {}",
+                    path.display(),
+                    e
+                ))
             })?;
             outfile.write_all(content).map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::Other,
-                    format!(
-                        "Failed to write content to file '{}': {}",
-                        path.display(),
-                        e
-                    ),
-                )
+                io::Error::other(format!(
+                    "Failed to write content to file '{}': {}",
+                    path.display(),
+                    e
+                ))
             })?;
 
             // Set permissions if available
             #[cfg(unix)]
             if let Some(mode) = mode_opt {
                 fs::set_permissions(path, fs::Permissions::from_mode(*mode)).map_err(|e| {
-                    io::Error::new(
-                        io::ErrorKind::Other,
-                        format!("Failed to set permissions on '{}': {}", path.display(), e),
-                    )
+                    io::Error::other(format!(
+                        "Failed to set permissions on '{}': {}",
+                        path.display(),
+                        e
+                    ))
                 })?;
             }
             Ok(())
@@ -150,6 +137,7 @@ pub fn unzip_files(src_path: &Path, dst_path: &Path) -> io::Result<()> {
 }
 
 #[pyfunction]
+#[pyo3(name = "unzip_files")]
 pub fn unzip_files_pywrapper(src_py: String, dst_py: String) -> PyResult<()> {
     let src_path = PathBuf::from(src_py);
     let dst_path = PathBuf::from(dst_py);

@@ -106,12 +106,7 @@ pub fn zip_files(dst: &Path, srcs: &[PathBuf]) -> io::Result<()> {
                         let content = fs::read(path)?;
                         sender
                             .send((archive_path_for_item, content, permissions))
-                            .map_err(|e| {
-                                io::Error::new(
-                                    io::ErrorKind::Other,
-                                    format!("Channel send error: {}", e),
-                                )
-                            })?;
+                            .map_err(|e| io::Error::other(format!("Channel send error: {}", e)))?;
                         Ok(())
                     } else {
                         Ok(())
@@ -202,6 +197,7 @@ pub fn zip_files(dst: &Path, srcs: &[PathBuf]) -> io::Result<()> {
 
 // PyO3 wrapper function
 #[pyfunction]
+#[pyo3(name = "zip_files")]
 pub fn zip_files_pywrapper(dst_py: String, srcs_py: Vec<String>) -> PyResult<()> {
     let dst_path = PathBuf::from(dst_py);
     let src_paths: Vec<PathBuf> = srcs_py.into_iter().map(PathBuf::from).collect();
