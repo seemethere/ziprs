@@ -1,5 +1,3 @@
-use crate::zip::zip_files_pywrapper as zip_files_py_wrapper;
-use crate::zip::{zip_files, Compression};
 use pyo3::exceptions::PyIOError;
 use pyo3::prelude::*;
 use rayon::prelude::*;
